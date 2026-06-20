@@ -1,0 +1,36 @@
+# Rust
+target/
+Cargo.lock
+
+# 환경변수 및 민감한 정보
+.env
+.env.*
+*.env
+secrets/
+config/local.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# 포렌식 분석 대상 파일 (실수로 커밋 방지)
+*.img
+*.dd
+*.raw
+*.vmem
+*.dmp
+*.pcap
+*.pcapng
+*.E01
+*.evtx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp

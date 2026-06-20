@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "common",
+    "disk",
+    "memory",
+    "network",
+    "windows",
+]
+resolver = "2"
