@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use network::{analyze_pcap, extract_connections, extract_dns, extract_http};
-use prettytable::{row, Table};
+use prettytable::{Table, row};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -39,6 +39,13 @@ enum Commands {
     },
 }
 
+/// 손상 패킷이 있으면 stderr로 경고 (JSON 출력 오염 방지)
+fn warn_skipped(skipped: u64) {
+    if skipped > 0 {
+        eprintln!("[경고] 손상된 패킷 {skipped}개를 건너뛰었습니다");
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     common::init_logging();
     let cli = Cli::parse();
@@ -46,6 +53,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Info { path, json } => {
             let info = analyze_pcap(&path)?;
+            warn_skipped(info.skipped_packets);
             if json {
                 println!("{}", serde_json::to_string_pretty(&info)?);
             } else {
@@ -53,10 +61,14 @@ fn main() -> anyhow::Result<()> {
                 table.add_row(row!["항목", "값"]);
                 table.add_row(row!["경로", info.path]);
                 table.add_row(row!["크기", format!("{} bytes", info.size_bytes)]);
-                table.add_row(row!["버전", format!("{}.{}", info.version_major, info.version_minor)]);
+                table.add_row(row![
+                    "버전",
+                    format!("{}.{}", info.version_major, info.version_minor)
+                ]);
                 table.add_row(row!["링크 타입", info.datalink]);
                 table.add_row(row!["Snaplen", info.snaplen]);
                 table.add_row(row!["패킷 수", info.packet_count]);
+                table.add_row(row!["손상으로 건너뛴 패킷", info.skipped_packets]);
                 table.add_row(row!["첫 패킷", info.first_ts]);
                 table.add_row(row!["마지막 패킷", info.last_ts]);
                 table.add_row(row!["MD5", info.md5]);
@@ -66,21 +78,25 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Connections { path, json } => {
-            let conns = extract_connections(&path)?;
+            let result = extract_connections(&path)?;
+            warn_skipped(result.skipped_packets);
             if json {
-                println!("{}", serde_json::to_string_pretty(&conns)?);
+                println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
+                let conns = &result.records;
                 let mut table = Table::new();
-                table.add_row(row!["프로토콜", "출발지 IP", "출발지 포트", "목적지 IP", "목적지 포트", "패킷", "바이트"]);
-                for c in &conns {
+                table.add_row(row![
+                    "프로토콜",
+                    "출발지 IP",
+                    "출발지 포트",
+                    "목적지 IP",
+                    "목적지 포트",
+                    "패킷",
+                    "바이트"
+                ]);
+                for c in conns {
                     table.add_row(row![
-                        c.protocol,
-                        c.src_ip,
-                        c.src_port,
-                        c.dst_ip,
-                        c.dst_port,
-                        c.packets,
-                        c.bytes
+                        c.protocol, c.src_ip, c.src_port, c.dst_ip, c.dst_port, c.packets, c.bytes
                     ]);
                 }
                 println!("[연결 목록] {} 개", conns.len());
@@ -88,13 +104,15 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Dns { path, json } => {
-            let entries = extract_dns(&path)?;
+            let result = extract_dns(&path)?;
+            warn_skipped(result.skipped_packets);
             if json {
-                println!("{}", serde_json::to_string_pretty(&entries)?);
+                println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
+                let entries = &result.records;
                 let mut table = Table::new();
                 table.add_row(row!["TXID", "방향", "출발지", "목적지", "질의", "응답"]);
-                for e in &entries {
+                for e in entries {
                     let direction = if e.is_response { "응답" } else { "질의" };
                     table.add_row(row![
                         format!("0x{:04X}", e.transaction_id),
@@ -110,13 +128,15 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Http { path, json } => {
-            let requests = extract_http(&path)?;
+            let result = extract_http(&path)?;
+            warn_skipped(result.skipped_packets);
             if json {
-                println!("{}", serde_json::to_string_pretty(&requests)?);
+                println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
+                let requests = &result.records;
                 let mut table = Table::new();
                 table.add_row(row!["출발지", "목적지", "메서드", "Host", "경로"]);
-                for r in &requests {
+                for r in requests {
                     table.add_row(row![
                         format!("{}:{}", r.src_ip, r.src_port),
                         format!("{}:{}", r.dst_ip, r.dst_port),

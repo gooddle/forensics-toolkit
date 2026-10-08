@@ -1,9 +1,8 @@
 use crate::error::NetworkError;
+use crate::reader::{Extraction, scan_packets};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
-use pcap_file::pcap::PcapReader;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::fs::File;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -27,21 +26,14 @@ struct ConnKey {
     dst_port: u16,
 }
 
-pub fn extract_connections(path: &Path) -> Result<Vec<Connection>, NetworkError> {
-    let file = File::open(path).map_err(|e| NetworkError::OpenFailed {
-        path: path.display().to_string(),
-        source: e,
-    })?;
-
-    let mut reader = PcapReader::new(file)
-        .map_err(|e| NetworkError::ParseFailed(e.to_string()))?;
-
+pub fn extract_connections(path: &Path) -> Result<Extraction<Connection>, NetworkError> {
     let mut map: HashMap<ConnKey, (u64, u64)> = HashMap::new();
+    let mut malformed: u64 = 0;
 
-    while let Some(pkt) = reader.next_packet() {
-        let pkt = pkt.map_err(|e| NetworkError::ParseFailed(e.to_string()))?;
+    let summary = scan_packets(path, |pkt| {
         let Ok(sliced) = SlicedPacket::from_ethernet(&pkt.data) else {
-            continue;
+            malformed += 1;
+            return;
         };
 
         let (src_ip4, dst_ip4, proto) = match &sliced.net {
@@ -49,13 +41,13 @@ pub fn extract_connections(path: &Path) -> Result<Vec<Connection>, NetworkError>
                 let h = ip.header();
                 (h.source(), h.destination(), h.protocol().0)
             }
-            _ => continue,
+            _ => return,
         };
 
         let (src_port, dst_port) = match &sliced.transport {
             Some(TransportSlice::Tcp(t)) => (t.source_port(), t.destination_port()),
             Some(TransportSlice::Udp(u)) => (u.source_port(), u.destination_port()),
-            _ => continue,
+            _ => return,
         };
 
         let key = ConnKey {
@@ -68,7 +60,7 @@ pub fn extract_connections(path: &Path) -> Result<Vec<Connection>, NetworkError>
         let entry = map.entry(key).or_insert((0, 0));
         entry.0 += 1;
         entry.1 += pkt.data.len() as u64;
-    }
+    })?;
 
     let mut connections: Vec<Connection> = map
         .into_iter()
@@ -89,7 +81,10 @@ pub fn extract_connections(path: &Path) -> Result<Vec<Connection>, NetworkError>
         .collect();
 
     connections.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-    Ok(connections)
+    Ok(Extraction {
+        records: connections,
+        skipped_packets: summary.skipped + malformed,
+    })
 }
 
 #[cfg(test)]
@@ -112,7 +107,7 @@ mod tests {
         let udp: Vec<u8> = {
             let mut u = Vec::new();
             u.extend_from_slice(&12345u16.to_be_bytes()); // src port
-            u.extend_from_slice(&53u16.to_be_bytes());    // dst port
+            u.extend_from_slice(&53u16.to_be_bytes()); // dst port
             u.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
             u.extend_from_slice(&0u16.to_be_bytes()); // checksum
             u.extend_from_slice(payload);
@@ -121,14 +116,16 @@ mod tests {
         let ip: Vec<u8> = {
             let mut i = Vec::new();
             let ip_len = (20 + udp.len()) as u16;
-            i.push(0x45); i.push(0);
+            i.push(0x45);
+            i.push(0);
             i.extend_from_slice(&ip_len.to_be_bytes());
             i.extend_from_slice(&0u16.to_be_bytes()); // ID
             i.extend_from_slice(&0u16.to_be_bytes()); // flags+frag
-            i.push(64); i.push(17); // TTL, proto=UDP
+            i.push(64);
+            i.push(17); // TTL, proto=UDP
             i.extend_from_slice(&0u16.to_be_bytes()); // checksum
             i.extend_from_slice(&[192, 168, 1, 1]); // src
-            i.extend_from_slice(&[8, 8, 8, 8]);     // dst
+            i.extend_from_slice(&[8, 8, 8, 8]); // dst
             i.extend_from_slice(&udp);
             i
         };
@@ -152,11 +149,33 @@ mod tests {
     fn test_extract_udp_connection() {
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(&pcap_with_udp_packet()).unwrap();
-        let conns = extract_connections(tmp.path()).unwrap();
+        let result = extract_connections(tmp.path()).unwrap();
+        assert_eq!(result.skipped_packets, 0);
+        let conns = result.records;
         assert_eq!(conns.len(), 1);
         assert_eq!(conns[0].protocol, "UDP");
         assert_eq!(conns[0].src_ip, "192.168.1.1");
         assert_eq!(conns[0].dst_ip, "8.8.8.8");
         assert_eq!(conns[0].dst_port, 53);
+    }
+
+    #[test]
+    fn test_extract_connections_skips_corrupt_packets() {
+        use crate::reader::test_util::*;
+
+        let frame = ipv4_frame(17, [192, 168, 1, 1], [8, 8, 8, 8], 12345, 53, b"hello");
+        let mut v = pcap_header();
+        push_packet(&mut v, &frame);
+        push_record(&mut v, &frame, frame.len() as u32, 1); // 레코드 헤더 손상
+        push_packet(&mut v, &frame[..20]); // IPv4 헤더가 잘린 프레임
+        push_packet(&mut v, &frame);
+        push_record(&mut v, &frame[..4], 4096, 4096); // 잘린 꼬리 레코드
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&v).unwrap();
+        let result = extract_connections(tmp.path()).unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].packets, 2);
+        assert_eq!(result.skipped_packets, 3);
     }
 }

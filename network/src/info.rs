@@ -1,8 +1,7 @@
 use crate::error::NetworkError;
+use crate::reader::scan_packets;
 use common::{format_unix_ts, hash_file};
-use pcap_file::pcap::PcapReader;
 use serde::Serialize;
-use std::fs::File;
 use std::path::Path;
 
 #[derive(Debug, Serialize)]
@@ -16,6 +15,8 @@ pub struct PcapInfo {
     pub snaplen: u32,
     pub datalink: String,
     pub packet_count: u64,
+    /// 레코드 손상으로 건너뛴 패킷 수
+    pub skipped_packets: u64,
     pub first_ts: String,
     pub last_ts: String,
     pub analyzed_at: String,
@@ -24,33 +25,24 @@ pub struct PcapInfo {
 pub fn analyze_pcap(path: &Path) -> Result<PcapInfo, NetworkError> {
     let hash = hash_file(path).map_err(NetworkError::Other)?;
 
-    let file = File::open(path).map_err(|e| NetworkError::OpenFailed {
-        path: path.display().to_string(),
-        source: e,
-    })?;
-
-    let mut reader = PcapReader::new(file)
-        .map_err(|e| NetworkError::ParseFailed(e.to_string()))?;
-
-    let header = reader.header();
-    let datalink = format!("{:?}", header.datalink);
-    let version_major = header.version_major;
-    let version_minor = header.version_minor;
-    let snaplen = header.snaplen;
-
     let mut packet_count: u64 = 0;
     let mut first_secs: Option<u64> = None;
     let mut last_secs: u64 = 0;
 
-    while let Some(pkt) = reader.next_packet() {
-        let pkt = pkt.map_err(|e| NetworkError::ParseFailed(e.to_string()))?;
+    let summary = scan_packets(path, |pkt| {
         let secs = pkt.timestamp.as_secs();
         if first_secs.is_none() {
             first_secs = Some(secs);
         }
         last_secs = secs;
         packet_count += 1;
-    }
+    })?;
+
+    let header = summary.header;
+    let datalink = format!("{:?}", header.datalink);
+    let version_major = header.version_major;
+    let version_minor = header.version_minor;
+    let snaplen = header.snaplen;
 
     let first_ts = first_secs
         .map(|s| format_unix_ts(s as i64))
@@ -71,6 +63,7 @@ pub fn analyze_pcap(path: &Path) -> Result<PcapInfo, NetworkError> {
         snaplen,
         datalink,
         packet_count,
+        skipped_packets: summary.skipped,
         first_ts,
         last_ts,
         analyzed_at: format_unix_ts(chrono::Utc::now().timestamp()),
@@ -113,5 +106,25 @@ mod tests {
         assert_eq!(info.version_major, 2);
         assert_eq!(info.version_minor, 4);
         assert_eq!(info.datalink, "ETHERNET");
+        assert_eq!(info.skipped_packets, 0);
+    }
+
+    #[test]
+    fn test_analyze_pcap_counts_corrupt_records() {
+        let mut v = minimal_pcap();
+        crate::reader::test_util::push_record(&mut v, &[0u8; 14], 14, 1);
+        crate::reader::test_util::push_packet(&mut v, &[0u8; 14]);
+        let mut tmp = Builder::new().suffix(".pcap").tempfile().unwrap();
+        tmp.write_all(&v).unwrap();
+        let info = analyze_pcap(tmp.path()).unwrap();
+        assert_eq!(info.packet_count, 2);
+        assert_eq!(info.skipped_packets, 1);
+    }
+
+    #[test]
+    fn test_analyze_pcap_bad_header_is_error() {
+        let mut tmp = Builder::new().suffix(".pcap").tempfile().unwrap();
+        tmp.write_all(&[0u8; 24]).unwrap();
+        assert!(analyze_pcap(tmp.path()).is_err());
     }
 }

@@ -3,9 +3,11 @@ pub mod dns;
 pub mod error;
 pub mod http;
 pub mod info;
+mod reader;
 
-pub use connections::{extract_connections, Connection};
-pub use dns::{extract_dns, DnsEntry};
+pub use connections::{Connection, extract_connections};
+pub use dns::{DnsEntry, extract_dns};
 pub use error::NetworkError;
-pub use http::{extract_http, HttpRequest};
-pub use info::{analyze_pcap, PcapInfo};
+pub use http::{HttpRequest, extract_http};
+pub use info::{PcapInfo, analyze_pcap};
+pub use reader::Extraction;
