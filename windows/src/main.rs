@@ -56,7 +56,10 @@ fn main() -> anyhow::Result<()> {
                 table.add_row(row!["실행 파일", info.executable_name]);
                 table.add_row(row!["Prefetch Hash", info.prefetch_hash]);
                 table.add_row(row!["실행 횟수", info.run_count]);
-                table.add_row(row!["마지막 실행", info.last_run_time]);
+                table.add_row(row![
+                    "마지막 실행",
+                    info.last_run_time.as_deref().unwrap_or("미기록")
+                ]);
                 table.add_row(row!["참조 파일 수", info.referenced_files.len()]);
                 println!("[Prefetch]");
                 table.printstd();
@@ -73,10 +76,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Evtx { path, limit, event_id, json } => {
-            let mut records = parse_evtx(&path, limit)?;
-            if let Some(eid) = event_id {
-                records.retain(|r| r.event_id == eid);
+            let scan = parse_evtx(&path, limit, event_id)?;
+            if scan.skipped > 0 {
+                eprintln!("[경고] 파싱 실패로 건너뛴 레코드: {} 건", scan.skipped);
             }
+            let records = scan.records;
             if json {
                 println!("{}", serde_json::to_string_pretty(&records)?);
             } else {

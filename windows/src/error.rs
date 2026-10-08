@@ -15,6 +15,9 @@ pub enum WindowsError {
     #[error("지원하지 않는 Prefetch 버전: {0}")]
     UnsupportedPrefetchVersion(u32),
 
+    #[error("손상된 Prefetch 필드 {field}: {detail}")]
+    CorruptPrefetch { field: &'static str, detail: String },
+
     #[error("EVTX 파싱 실패: {0}")]
     EvtxParseFailed(String),
 

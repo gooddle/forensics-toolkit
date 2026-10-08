@@ -17,12 +17,18 @@ pub struct PrefetchInfo {
     pub executable_name: String,
     pub prefetch_hash: String,
     pub run_count: u32,
-    pub last_run_time: String,
+    /// `None` when the FILETIME is 0 (never recorded).
+    pub last_run_time: Option<String>,
     pub referenced_files: Vec<String>,
 }
 
-fn filetime_to_unix(ft: u64) -> i64 {
-    (ft / 10_000_000) as i64 - FILETIME_EPOCH_DIFF_SECS
+/// Converts a FILETIME to Unix seconds. 0 means "not recorded" and yields `None`
+/// instead of 1601-01-01.
+fn filetime_to_unix(ft: u64) -> Option<i64> {
+    if ft == 0 {
+        return None;
+    }
+    Some((ft / 10_000_000) as i64 - FILETIME_EPOCH_DIFF_SECS)
 }
 
 fn read_utf16le_name(buf: &[u8]) -> String {
@@ -39,6 +45,7 @@ pub fn parse_prefetch(path: &Path) -> Result<PrefetchInfo, WindowsError> {
         path: path.display().to_string(),
         source: e,
     })?;
+    let file_len = file.metadata()?.len();
     let mut r = BufReader::new(file);
 
     let version = r.read_u32::<LittleEndian>()?;
@@ -48,10 +55,13 @@ pub fn parse_prefetch(path: &Path) -> Result<PrefetchInfo, WindowsError> {
         return Err(WindowsError::InvalidPrefetchSignature);
     }
 
-    match version {
-        17 | 23 | 26 => {}
+    // Last run time + run count — version-specific offsets
+    let (last_run_offset, run_count_offset) = match version {
+        17 => (0x78u64, 0x90u64),
+        23 => (0x78u64, 0x98u64),
+        26 => (0x80u64, 0xD0u64),
         v => return Err(WindowsError::UnsupportedPrefetchVersion(v)),
-    }
+    };
 
     let _unknown = r.read_u32::<LittleEndian>()?;
     let _file_size = r.read_u32::<LittleEndian>()?;
@@ -72,24 +82,25 @@ pub fn parse_prefetch(path: &Path) -> Result<PrefetchInfo, WindowsError> {
     let filenames_offset = r.read_u32::<LittleEndian>()?;
     let filenames_size = r.read_u32::<LittleEndian>()?;
 
-    // Last run time + run count — version-specific offsets
-    let (last_run_offset, run_count_offset) = match version {
-        17 => (0x78u64, 0x90u64),
-        23 => (0x78u64, 0x98u64),
-        26 => (0x80u64, 0xD0u64),
-        _ => unreachable!(),
-    };
-
     r.seek(SeekFrom::Start(last_run_offset))?;
     let last_run_ft = r.read_u64::<LittleEndian>()?;
-    let last_run_unix = filetime_to_unix(last_run_ft);
-    let last_run_time = common::format_unix_ts(last_run_unix);
+    let last_run_time = filetime_to_unix(last_run_ft).map(common::format_unix_ts);
 
     r.seek(SeekFrom::Start(run_count_offset))?;
     let run_count = r.read_u32::<LittleEndian>()?;
 
     // Referenced filenames string block
     let referenced_files = if filenames_size > 0 && filenames_offset > 0 {
+        // Validate against the real file size before allocating.
+        let end = u64::from(filenames_offset) + u64::from(filenames_size);
+        if end > file_len {
+            return Err(WindowsError::CorruptPrefetch {
+                field: "filenames",
+                detail: format!(
+                    "offset {filenames_offset:#x} + size {filenames_size:#x} exceeds file size {file_len:#x}"
+                ),
+            });
+        }
         r.seek(SeekFrom::Start(filenames_offset as u64))?;
         let mut buf = vec![0u8; filenames_size as usize];
         r.read_exact(&mut buf)?;
@@ -151,7 +162,7 @@ mod tests {
         // version = 23 at offset 0
         (&mut buf[0..4]).write_u32::<LittleEndian>(23).unwrap();
         // signature "SCCA" at offset 4
-        (&mut buf[4..8]).copy_from_slice(b"SCCA");
+        buf[4..8].copy_from_slice(b"SCCA");
         // file size at offset 12
         (&mut buf[12..16]).write_u32::<LittleEndian>(0x200).unwrap();
 
@@ -194,6 +205,85 @@ mod tests {
         assert_eq!(info.executable_name, "CMD.EXE");
         assert_eq!(info.run_count, 42);
         assert_eq!(info.prefetch_hash, "DEADBEEF");
+    }
+
+    #[test]
+    fn test_v23_last_run_time_formatted() {
+        let mut tmp = Builder::new().suffix(".pf").tempfile().unwrap();
+        tmp.write_all(&make_prefetch_v23()).unwrap();
+        let info = parse_prefetch(tmp.path()).unwrap();
+        assert_eq!(
+            info.last_run_time.as_deref(),
+            Some("2024-01-01T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn test_zero_filetime_is_not_recorded() {
+        let mut buf = make_prefetch_v23();
+        (&mut buf[0x78..0x80]).write_u64::<LittleEndian>(0).unwrap();
+        let mut tmp = Builder::new().suffix(".pf").tempfile().unwrap();
+        tmp.write_all(&buf).unwrap();
+        let info = parse_prefetch(tmp.path()).unwrap();
+        assert_eq!(info.last_run_time, None);
+        assert_eq!(filetime_to_unix(0), None);
+    }
+
+    #[test]
+    fn test_oversized_filenames_size_returns_error() {
+        let mut buf = make_prefetch_v23();
+        (&mut buf[0x64..0x68])
+            .write_u32::<LittleEndian>(0x100)
+            .unwrap();
+        (&mut buf[0x68..0x6C])
+            .write_u32::<LittleEndian>(0xFFFF_FFF0)
+            .unwrap();
+        let mut tmp = Builder::new().suffix(".pf").tempfile().unwrap();
+        tmp.write_all(&buf).unwrap();
+        assert!(matches!(
+            parse_prefetch(tmp.path()),
+            Err(WindowsError::CorruptPrefetch {
+                field: "filenames",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_filenames_block_within_file_is_parsed() {
+        let mut buf = make_prefetch_v23();
+        let mut block: Vec<u8> = Vec::new();
+        for name in ["\\WINDOWS\\A.DLL", "\\WINDOWS\\B.DLL"] {
+            block.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+            block.extend_from_slice(&[0, 0]);
+        }
+        buf[0x100..0x100 + block.len()].copy_from_slice(&block);
+        (&mut buf[0x58..0x5C]).write_u32::<LittleEndian>(2).unwrap(); // metrics count
+        (&mut buf[0x64..0x68])
+            .write_u32::<LittleEndian>(0x100)
+            .unwrap();
+        (&mut buf[0x68..0x6C])
+            .write_u32::<LittleEndian>(block.len() as u32)
+            .unwrap();
+        let mut tmp = Builder::new().suffix(".pf").tempfile().unwrap();
+        tmp.write_all(&buf).unwrap();
+        let info = parse_prefetch(tmp.path()).unwrap();
+        assert_eq!(
+            info.referenced_files,
+            vec!["\\WINDOWS\\A.DLL", "\\WINDOWS\\B.DLL"]
+        );
+    }
+
+    #[test]
+    fn test_unsupported_version_returns_error() {
+        let mut buf = make_prefetch_v23();
+        (&mut buf[0..4]).write_u32::<LittleEndian>(30).unwrap();
+        let mut tmp = Builder::new().suffix(".pf").tempfile().unwrap();
+        tmp.write_all(&buf).unwrap();
+        assert!(matches!(
+            parse_prefetch(tmp.path()),
+            Err(WindowsError::UnsupportedPrefetchVersion(30))
+        ));
     }
 
     #[test]
