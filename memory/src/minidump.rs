@@ -7,6 +7,7 @@ use std::path::Path;
 
 const MDMP_SIGNATURE: u32 = 0x504D_444D; // "MDMP"
 const MDMP_VALID_VERSION: u16 = 0xA793;
+const STREAM_ENTRY_SIZE: u64 = 12; // MINIDUMP_DIRECTORY
 
 #[derive(Debug, Serialize)]
 pub struct MinidumpInfo {
@@ -18,6 +19,8 @@ pub struct MinidumpInfo {
     pub timestamp: u32,
     pub flags: u64,
     pub streams: Vec<StreamEntry>,
+    /// 디렉터리가 잘려 읽지 못한 스트림 엔트리 수 (stream_count - streams.len())
+    pub streams_missing: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +64,7 @@ pub fn parse_minidump(path: &Path) -> Result<MinidumpInfo, MemoryError> {
         path: path.display().to_string(),
         source: e,
     })?;
+    let file_len = file.metadata()?.len();
     let mut r = BufReader::new(file);
 
     let sig = r.read_u32::<LittleEndian>()?;
@@ -82,10 +86,16 @@ pub fn parse_minidump(path: &Path) -> Result<MinidumpInfo, MemoryError> {
         )));
     }
 
-    r.seek(SeekFrom::Start(stream_directory_rva as u64))?;
+    // stream_count 는 파일에서 읽은 신뢰할 수 없는 값이므로
+    // 디렉터리 위치 이후 실제 파일 크기로 읽을 수 있는 엔트리 수를 상한으로 둔다
+    let available = file_len.saturating_sub(u64::from(stream_directory_rva)) / STREAM_ENTRY_SIZE;
+    let readable = u32::try_from(available).map_or(stream_count, |a| a.min(stream_count));
 
-    let mut streams = Vec::with_capacity(stream_count as usize);
-    for _ in 0..stream_count {
+    let mut streams = Vec::with_capacity(readable as usize);
+    if readable > 0 {
+        r.seek(SeekFrom::Start(u64::from(stream_directory_rva)))?;
+    }
+    for _ in 0..readable {
         let stream_type = r.read_u32::<LittleEndian>()?;
         let data_size = r.read_u32::<LittleEndian>()?;
         let rva = r.read_u32::<LittleEndian>()?;
@@ -106,6 +116,7 @@ pub fn parse_minidump(path: &Path) -> Result<MinidumpInfo, MemoryError> {
         timestamp,
         flags,
         streams,
+        streams_missing: stream_count - readable,
     })
 }
 
@@ -163,6 +174,44 @@ mod tests {
         assert_eq!(info.stream_count, 2);
         assert_eq!(info.streams.len(), 2);
         assert_eq!(info.streams[0].type_name, "ThreadListStream");
+        assert_eq!(info.streams_missing, 0);
+    }
+
+    fn parse_bytes(bytes: &[u8]) -> Result<MinidumpInfo, MemoryError> {
+        let mut tmp = Builder::new().suffix(".dmp").tempfile().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        parse_minidump(tmp.path())
+    }
+
+    #[test]
+    fn test_huge_stream_count_truncated_directory() {
+        let mut bytes = make_minidump_bytes(2);
+        bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let info = parse_bytes(&bytes).unwrap();
+        assert_eq!(info.stream_count, u32::MAX);
+        assert_eq!(info.streams.len(), 2);
+        assert_eq!(info.streams_missing, u32::MAX - 2);
+        assert_eq!(info.streams[1].type_name, "ModuleListStream");
+    }
+
+    #[test]
+    fn test_partial_directory_entry_ignored() {
+        let mut bytes = make_minidump_bytes(3);
+        bytes.truncate(bytes.len() - 5); // 마지막 엔트리 일부만 남음
+        let info = parse_bytes(&bytes).unwrap();
+        assert_eq!(info.streams.len(), 2);
+        assert_eq!(info.streams_missing, 1);
+    }
+
+    #[test]
+    fn test_directory_rva_beyond_eof() {
+        let mut bytes = make_minidump_bytes(1);
+        bytes[12..16].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        let info = parse_bytes(&bytes).unwrap();
+        assert_eq!(info.timestamp, 0x6856_0000);
+        assert!(info.streams.is_empty());
+        assert_eq!(info.streams_missing, 1);
     }
 
     #[test]
