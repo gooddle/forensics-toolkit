@@ -47,10 +47,16 @@ impl Read for PartitionSlice {
 impl Seek for PartitionSlice {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let new_pos = match pos {
-            SeekFrom::Start(n) => n,
-            SeekFrom::Current(n) => (self.pos as i64 + n) as u64,
-            SeekFrom::End(n) => (self.len as i64 + n) as u64,
-        };
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::Current(n) => self.pos.checked_add_signed(n),
+            SeekFrom::End(n) => self.len.checked_add_signed(n),
+        }
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek 위치가 0 미만이거나 범위를 벗어남",
+            )
+        })?;
         self.pos = new_pos.min(self.len);
         Ok(self.pos)
     }
@@ -148,4 +154,39 @@ pub fn list_fat32(
     collect_entries(root, "", 0, max_depth, &mut entries);
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_slice(len: u64) -> PartitionSlice {
+        // seek 은 파일을 건드리지 않으므로 아무 읽기 가능한 파일이면 된다
+        let file = tempfile::tempfile().unwrap();
+        PartitionSlice::new(file, 0, len)
+    }
+
+    #[test]
+    fn test_seek_negative_current_returns_error() {
+        let mut slice = make_slice(100);
+        slice.seek(SeekFrom::Start(10)).unwrap();
+        let err = slice.seek(SeekFrom::Current(-11)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(slice.pos, 10);
+    }
+
+    #[test]
+    fn test_seek_negative_end_returns_error() {
+        let mut slice = make_slice(100);
+        let err = slice.seek(SeekFrom::End(-101)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_seek_valid_relative_positions() {
+        let mut slice = make_slice(100);
+        assert_eq!(slice.seek(SeekFrom::End(-20)).unwrap(), 80);
+        assert_eq!(slice.seek(SeekFrom::Current(-30)).unwrap(), 50);
+        assert_eq!(slice.seek(SeekFrom::Current(1000)).unwrap(), 100);
+    }
 }

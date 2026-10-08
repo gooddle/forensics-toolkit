@@ -5,6 +5,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+const MBR_SIGNATURE: u16 = 0xAA55;
+const MBR_FIRST_ENTRY_TYPE: usize = 446 + 4;
+const GPT_PROTECTIVE_TYPE: u8 = 0xEE;
+
 #[derive(Debug, Serialize)]
 pub enum PartitionScheme {
     Mbr(Vec<MbrPartition>),
@@ -138,16 +142,22 @@ pub fn parse_partitions(path: &Path) -> Result<PartitionScheme, DiskError> {
         return Ok(PartitionScheme::Unknown);
     }
 
-    let sig = u16::from_le_bytes([sector[510], sector[511]]);
-    if sig != 0x55AA {
-        return Err(DiskError::InvalidMbrSignature(sig));
-    }
-
-    if sector[446] == 0xEE {
+    if is_gpt_protective(&sector)? {
         return parse_gpt(path);
     }
 
     parse_mbr(&sector)
+}
+
+/// MBR 시그니처를 검증하고, 보호 MBR(GPT)인지 판별한다.
+fn is_gpt_protective(sector: &[u8; 512]) -> Result<bool, DiskError> {
+    // 디스크상 바이트 0x55, 0xAA 를 LE u16 으로 읽으면 0xAA55
+    let sig = u16::from_le_bytes([sector[510], sector[511]]);
+    if sig != MBR_SIGNATURE {
+        return Err(DiskError::InvalidMbrSignature(sig));
+    }
+    // 첫 파티션 엔트리(446)의 타입 바이트(+4)가 0xEE 이면 GPT 보호 MBR
+    Ok(sector[MBR_FIRST_ENTRY_TYPE] == GPT_PROTECTIVE_TYPE)
 }
 
 #[cfg(test)]
@@ -217,6 +227,48 @@ mod tests {
         tmp.write_all(&[0u8; 512]).unwrap();
         let result = parse_partitions(tmp.path());
         assert!(matches!(result, Err(DiskError::InvalidMbrSignature(_))));
+    }
+
+    #[test]
+    fn test_valid_mbr_signature_parses_partitions() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let sector = make_mbr(&[(0x80, 0x0B, 2048, 204800)]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&sector).unwrap();
+        let scheme = parse_partitions(tmp.path()).unwrap();
+        match scheme {
+            PartitionScheme::Mbr(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert_eq!(parts[0].start_lba, 2048);
+            }
+            other => panic!("Expected MBR, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_gpt_detected_by_first_entry_type() {
+        let sector = make_mbr(&[(0x00, 0xEE, 1, u32::MAX)]);
+        assert!(is_gpt_protective(&sector).unwrap());
+    }
+
+    #[test]
+    fn test_boot_flag_0xee_is_not_gpt() {
+        // 부팅 플래그 바이트가 0xEE 여도 타입이 FAT32 면 MBR 로 판별해야 함
+        let sector = make_mbr(&[(0xEE, 0x0B, 2048, 204800)]);
+        assert!(!is_gpt_protective(&sector).unwrap());
+    }
+
+    #[test]
+    fn test_byte_swapped_signature_rejected() {
+        let mut sector = make_mbr(&[(0x00, 0x0B, 2048, 204800)]);
+        sector[510] = 0xAA;
+        sector[511] = 0x55;
+        assert!(matches!(
+            is_gpt_protective(&sector),
+            Err(DiskError::InvalidMbrSignature(0x55AA))
+        ));
     }
 
     #[test]

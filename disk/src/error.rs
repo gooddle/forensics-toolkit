@@ -15,6 +15,9 @@ pub enum DiskError {
     #[error("GPT 헤더 파싱 실패: {0}")]
     GptParseFailed(String),
 
+    #[error("잘못된 BPB: {0}")]
+    InvalidBpb(String),
+
     #[error("지원하지 않는 파일시스템: {0}")]
     UnsupportedFilesystem(String),
 
