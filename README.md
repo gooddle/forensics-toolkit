@@ -12,6 +12,7 @@ Rust 기반 인시던트 리스폰스(IR)용 포렌식 툴킷.
 | `windows` | Prefetch 실행 기록, EVTX 이벤트 로그, 레지스트리 자동 실행 항목 |
 | `macos` | LaunchAgents 스캔, 터미널 히스토리, 다운로드 기록, 앱 사용 이력 |
 | `android` | SMS·통화 기록, 설치 패키지 목록(packages.xml, ABX 포함), APK 위험 권한 분석 |
+| `ios` | SMS/iMessage·통화 기록, KnowledgeC 앱 사용 이력, Quarantine 다운로드 기록 |
 | `common` | 해시(MD5/SHA256), 로깅, 타임스탬프 공통 유틸 |
 
 ## 빌드
@@ -208,6 +209,28 @@ cargo run -p android -- apk sample.apk
 ```
 
 - SQLite DB는 `immutable=1` 읽기 전용으로 열어 원본과 `-wal`/`-shm`을 변경하지 않습니다. 이 때문에 체크포인트되지 않은 `-wal` 내용은 결과에 포함되지 않습니다.
+
+---
+
+## ios — iOS 아티팩트 분석
+
+분석 대상: 백업/추출 이미지의 `sms.db`, `CallHistory.storedata`, `knowledgeC.db`, (동기화한 Mac의) `QuarantineEventsV2`
+
+```bash
+# SMS/iMessage (iOS 11+ 나노초 날짜 자동 판별, text가 비면 attributedBody에서 본문 추출)
+cargo run -p ios -- sms sms.db --limit 0
+
+# 통화 기록
+cargo run -p ios -- calls CallHistory.storedata
+
+# 앱 사용 이력 (/private/var/mobile/Library/CoreDuet/Knowledge/knowledgeC.db)
+cargo run -p ios -- knowledgec knowledgeC.db --json
+
+# 다운로드 기록 (동기화한 Mac의 ~/Library/Preferences/com.apple.LaunchServices.QuarantineEventsV2)
+cargo run -p ios -- quarantine QuarantineEventsV2
+```
+
+- KnowledgeC/Quarantine 파서는 `common::apple`에 있으며 macOS 모듈과 공유합니다.
 
 ---
 

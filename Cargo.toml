@@ -7,5 +7,6 @@ members = [
     "windows",
     "macos",
     "android",
+    "ios",
 ]
 resolver = "2"
