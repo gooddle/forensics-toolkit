@@ -1,3 +1,4 @@
+pub mod apple;
 pub mod hash;
 pub mod logging;
 pub mod sqlite;

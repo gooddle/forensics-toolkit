@@ -19,6 +19,9 @@ pub enum MacosError {
     PathNotFound(String),
 
     #[error(transparent)]
+    Sqlite(#[from] common::sqlite::SqliteError),
+
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
