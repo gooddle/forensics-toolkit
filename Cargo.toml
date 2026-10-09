@@ -6,5 +6,7 @@ members = [
     "network",
     "windows",
     "macos",
+    "android",
+    "ios",
 ]
 resolver = "2"
