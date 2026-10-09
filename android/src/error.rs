@@ -33,3 +33,17 @@ pub enum AndroidError {
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
+
+impl From<common::sqlite::SqliteError> for AndroidError {
+    fn from(e: common::sqlite::SqliteError) -> Self {
+        use common::sqlite::SqliteError as E;
+        match e {
+            E::OpenFailed { path, source } => AndroidError::OpenFailed { path, source },
+            E::NonUtf8Path(p) => {
+                AndroidError::UnsupportedFormat(format!("UTF-8 이 아닌 경로는 지원하지 않음: {p}"))
+            }
+            E::Sqlite(m) => AndroidError::SqliteError(m),
+            E::SchemaMismatch(m) => AndroidError::SchemaMismatch(m),
+        }
+    }
+}
